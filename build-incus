@@ -1,0 +1,217 @@
+#!/bin/bash
+
+### build setup
+export CONCURRENCY=`cat /proc/cpuinfo |grep ^processor |wc -l`
+export BUILD=/build
+export GOPATH=$BUILD/go
+export PREFIX=$BUILD/usr
+export PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig
+export CFLAGS=-I$PREFIX/include
+export LDFLAGS="-L$PREFIX/lib"
+export CGO_CFLAGS=-I$PREFIX/include
+export CGO_LDFLAGS="-L$PREFIX/lib -lraft -luv -llz4 -lcrypto -ldbus-1 -lselinux -lseccomp -luring -lcap"
+rm -rf $BUILD && mkdir $BUILD
+
+### build tools
+sed -i 's/main$/main universe/' /etc/apt/sources.list
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y build-essential autoconf autoconf-archive automake libtool pkg-config curl git meson gperf bison flex libbpf-dev libmount-dev python3-jinja2 upx-ucl
+rm -rf /usr/lib/go-1.22 && mkdir -p /usr/lib/go-1.22
+curl -Lo - https://go.dev/dl/go1.22.3.linux-amd64.tar.gz |tar xz --strip-components=1 -C /usr/lib/go-1.22
+rm -f /usr/bin/go && ln -s /usr/lib/go-1.22/bin/go /usr/bin/go
+rm -f /usr/bin/gofmt && ln -s /usr/lib/go-1.22/bin/gofmt /usr/bin/gofmt
+
+### openssl (lxc dependency)
+cd $BUILD
+rm -rf openssl && mkdir openssl
+curl -Lo - https://www.openssl.org/source/openssl-3.3.0.tar.gz |tar xz --strip-components=1 -C openssl
+cd openssl
+./config --prefix=$PREFIX --libdir=lib -static no-zlib no-dso no-quic no-dsa no-idea no-rc5 no-mdc2
+make -j $CONCURRENCY
+make -j $CONCURRENCY install_sw
+
+### libcap (lxc dependency)
+cd $BUILD
+rm -rf libcap
+git clone git://git.kernel.org/pub/scm/libs/libcap/libcap
+cd libcap
+env lib=lib make -j $CONCURRENCY -C libcap install-static-cap
+
+### liburing (lxc dependency)
+cd $BUILD
+rm -rf liburing && mkdir liburing
+curl -Lo - https://github.com/axboe/liburing/archive/refs/tags/liburing-2.6.tar.gz |tar xz --strip-components=1 -C liburing
+cd liburing
+./configure --prefix=$PREFIX
+make -j $CONCURRENCY
+make -j $CONCURRENCY install
+
+### libseccomp (lxc dependency)
+cd $BUILD
+rm -rf libseccomp && mkdir libseccomp
+curl -Lo - https://github.com/seccomp/libseccomp/archive/refs/tags/v2.5.5.tar.gz |tar xz --strip-components=1 -C libseccomp
+cd libseccomp
+./autogen.sh
+./configure --prefix=$PREFIX --disable-shared
+make -j $CONCURRENCY
+make -j $CONCURRENCY install
+
+### libapparmor (lxc dependency)
+cd $BUILD
+rm -rf libapparmor && mkdir libapparmor
+curl -Lo - https://gitlab.com/apparmor/apparmor/-/archive/v4.0.1/apparmor-v4.0.1.tar.gz |tar xz --strip-components=1 -C libapparmor
+cd libapparmor/libraries/libapparmor
+./autogen.sh
+./configure --prefix=$PREFIX
+make -j $CONCURRENCY
+make -j $CONCURRENCY install
+
+### libpcre2 (libselinux dependency)
+cd $BUILD
+rm -rf libpcre2 && mkdir libpcre2
+curl -Lo - https://github.com/PCRE2Project/pcre2/archive/refs/tags/pcre2-10.43.tar.gz |tar xz --strip-components=1 -C libpcre2
+cd libpcre2
+./autogen.sh
+./configure --prefix /build/usr --disable-shared
+make -j $CONCURRENCY
+make -j $CONCURRENCY install
+
+### libselinux (lxc dependency)
+cd $BUILD
+rm -rf libselinux && mkdir libselinux
+curl -Lo - https://github.com/SELinuxProject/selinux/archive/refs/tags/3.6.tar.gz |tar xz --strip-components=1 -C libselinux
+cd libselinux
+make -j $CONCURRENCY -C libsepol install
+make -j $CONCURRENCY -C libselinux install
+
+### expat (dbus-1 dependency)
+cd $BUILD
+rm -rf expat && mkdir expat
+curl -Lo - https://github.com/libexpat/libexpat/releases/download/R_2_6_2/expat-2.6.2.tar.gz |tar xz --strip-components=1 -C expat
+cd expat
+./configure --prefix=$PREFIX --disable-shared
+make -j $CONCURRENCY
+make -j $CONCURRENCY install
+
+### dbus-1 (lxc dependency)
+cd $BUILD
+rm -rf dbus-1 && mkdir dbus-1
+curl -Lo - https://dbus.freedesktop.org/releases/dbus/dbus-1.14.10.tar.xz |tar xJ --strip-components=1 -C dbus-1
+cd dbus-1
+./configure --prefix=$PREFIX --disable-shared
+make -j $CONCURRENCY
+make -j $CONCURRENCY install
+
+### lxc (incus dependency)
+cd $BUILD
+rm -rf lxc && mkdir lxc
+curl -Lo - https://github.com/lxc/lxc/archive/refs/tags/v6.0.0.tar.gz |tar xz --strip-components=1 -C lxc
+cd lxc
+meson setup build --prefix /usr -Dio-uring-event-loop=true -Dman=false -Dtools=false
+meson compile -j $CONCURRENCY -C build lxc:static_library
+mkdir -p $PREFIX/include/lxc && cp build/src/lxc/*.h $PREFIX/include/lxc
+cp build/src/lxc/liblxc.a $PREFIX/lib
+sed 's/\/usr/\/build\/usr/' build/meson-private/lxc.pc |sed 's/\/x86_64-linux-gnu//' >$PREFIX/lib/pkgconfig/lxc.pc
+
+### libuv (raft & cowsql dependency)
+cd $BUILD
+rm -rf libuv && mkdir libuv
+curl -Lo - https://dist.libuv.org/dist/v1.48.0/libuv-v1.48.0.tar.gz |tar xz --strip-components=1 -C libuv
+cd libuv
+./autogen.sh && ./configure --prefix=$PREFIX --disable-shared
+make -j $CONCURRENCY
+make -j $CONCURRENCY install
+
+### libz4 (raft dependency)
+cd $BUILD
+rm -rf liblz4 && mkdir liblz4
+curl -Lo - https://github.com/lz4/lz4/archive/refs/tags/v1.9.4.tar.gz |tar xz --strip-components=1 -C liblz4
+cd liblz4
+make -j $CONCURRENCY -C lib BUILD_SHARED=no install
+
+### raft (cowsql dependency)
+cd $BUILD
+rm -rf raft && mkdir raft
+curl -Lo - https://github.com/cowsql/raft/archive/refs/tags/v0.22.1.tar.gz |tar xz --strip-components=1 -C raft
+cd raft
+autoreconf -i && ./configure --prefix=$PREFIX --disable-shared
+make -j $CONCURRENCY
+make -j $CONCURRENCY install
+
+### sqlite3 (cowsql dependency)
+cd $BUILD
+rm -rf sqlite3 && mkdir sqlite3
+curl -Lo - https://www.sqlite.org/2024/sqlite-autoconf-3450300.tar.gz |tar xz --strip-components=1 -C sqlite3
+cd sqlite3
+./configure --prefix=$PREFIX --disable-shared
+make -j $CONCURRENCY
+make -j $CONCURRENCY install
+
+### cowsql (incus dependency)
+cd $BUILD
+rm -rf cowsql && mkdir cowsql
+curl -Lo - https://github.com/cowsql/cowsql/archive/refs/tags/v1.15.4.tar.gz |tar xz --strip-components=1 -C cowsql
+cd cowsql
+autoreconf -i
+./configure --prefix=$PREFIX --disable-shared
+make -j $CONCURRENCY
+make -j $CONCURRENCY install
+
+### libattr (libacl dependency)
+cd $BUILD
+rm -rf libattr && mkdir libattr
+curl -Lo - http://download.savannah.nongnu.org/releases/attr/attr-2.5.2.tar.gz |tar xz --strip-components=1 -C libattr
+cd libattr
+./configure --prefix=$PREFIX --disable-shared
+make -j $CONCURRENCY
+make -j $CONCURRENCY install
+
+### libacl (incus dependency)
+cd $BUILD
+rm -rf libacl && mkdir libacl
+curl -Lo - http://download.savannah.nongnu.org/releases/acl/acl-2.3.2.tar.gz |tar xz --strip-components=1 -C libacl
+cd libacl
+./configure --prefix=$PREFIX --disable-shared
+make -j $CONCURRENCY
+make -j $CONCURRENCY install
+
+### libudev (incus dependency)
+cd $BUILD
+rm -rf libudev && mkdir libudev
+curl -Lo - https://github.com/systemd/systemd/archive/refs/tags/v255.tar.gz |tar xz --strip-components=1 -C libudev
+cd libudev
+meson setup build --prefix=/usr -Dmode=release -Dstatic-libsystemd=true -Dstatic-libudev=true
+meson compile -j $CONCURRENCY -C build libudev
+total=`find build -name '*.o' |wc -l`
+done=0
+for object in `find build -name '*.o'`
+do
+    ar cr libudev.a $object
+    ((done=done+1))
+    printf "  %3d/%d  %s                             \r" $done $total $object
+done
+echo
+mv libudev.a $PREFIX/lib
+cp src/libudev/libudev.h $PREFIX/include
+
+### sanitize C libraries tree
+rm -rf $PREFIX/{bin,etc,libexec,man,sbin,share,ssl,var} $PREFIX/lib/*.so* $PREFIX/lib/*.la
+
+### incus
+cd $BUILD
+rm -rf incus && mkdir incus
+curl -Lo - https://github.com/lxc/incus/archive/refs/tags/v6.0.0.tar.gz |tar xz --strip-components=1 -C incus
+cd incus
+sed -i 's/ACL_UNDEFINED_ID/_ACL_UNDEFINED_ID/' shared/cgo/incus_posix_acl_xattr.h
+sed -i 's/lxc_abstract_unix_send_fds(/_lxc_abstract_unix_send_fds(/' internal/netutils/unixfd.c
+sed -i 's/lxc_abstract_unix_recv_fds(/_lxc_abstract_unix_recv_fds(/' internal/netutils/unixfd.c
+for target in `find . -name main.go |sed 's/\/main.go$//'`
+do
+    echo [ $target ]
+    go install -ldflags '-linkmode external -extldflags -static' -tags netgo,osusergo $target
+    echo
+done
+cd $BUILD/go/bin
+strip *
+upx -9 *
